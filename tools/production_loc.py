@@ -21,6 +21,10 @@ TypeScript under dsh/packages/<package>/src, one crate per package
 and the untracked dsh/assets art are excluded. TypeScript comments are blanked
 by the same JavaScript scanner.
 
+Application integrations are their own scope, `integrations`: each
+integrations/<crate>/ with a Cargo.toml contributes its src/ Rust and its
+sql/ runtime SQL. Tests, target and generated files are excluded.
+
 Runtime SQL is counted for both scopes: a candidate package that ships schema or
 query text under <crate>/sql/ contributes it exactly like the reference schema.
 Per-file reporting uses the same classification as the totals, and prints the
@@ -326,12 +330,40 @@ def blank_js(source: str) -> str:
 
 
 def blank_sql(source: str) -> str:
-    """Blank -- line comments and block comments, keeping line numbering."""
-    lines = []
-    for line in source.splitlines():
-        stripped = line.lstrip()
-        lines.append("" if stripped.startswith("--") else line)
-    return "\n".join(lines)
+    """Blank -- and /* */ comments, keeping line numbering."""
+    chars = list(source)
+    out = list(chars)
+    index = 0
+    length = len(chars)
+    while index < length:
+        if chars[index] == "-" and index + 1 < length and chars[index + 1] == "-":
+            while index < length and chars[index] != "\n":
+                out[index] = " "
+                index += 1
+            continue
+        if chars[index] == "/" and index + 1 < length and chars[index + 1] == "*":
+            out[index] = " "
+            out[index + 1] = " "
+            index += 2
+            while index < length:
+                if chars[index] == "*" and index + 1 < length and chars[index + 1] == "/":
+                    out[index] = " "
+                    out[index + 1] = " "
+                    index += 2
+                    break
+                if chars[index] != "\n":
+                    out[index] = " "
+                index += 1
+            continue
+        if chars[index] in ("'", '"'):
+            quote = chars[index]
+            index += 1
+            while index < length and chars[index] != quote:
+                index += 2 if chars[index] == "\\" else 1
+            index += 1
+            continue
+        index += 1
+    return "".join(out)
 
 
 def counted_lines(path: Path) -> int:
@@ -345,7 +377,7 @@ def counted_lines(path: Path) -> int:
     return sum(1 for line in text.splitlines() if line.strip())
 
 
-SCOPES = ("core", "reference", "sdk", "dsh")
+SCOPES = ("core", "reference", "sdk", "dsh", "integrations")
 
 
 def scope_base(root: Path, scope: str) -> Path:
@@ -355,6 +387,8 @@ def scope_base(root: Path, scope: str) -> Path:
         return root / "sdk" / "js"
     if scope == "dsh":
         return root / "dsh" / "packages"
+    if scope == "integrations":
+        return root / "integrations"
     return root / "crates"
 
 
@@ -384,12 +418,38 @@ def dsh_crate(base: Path, path: Path) -> str:
     return package if package == "dsh-layerfs" else f"@dsh-layerfs/{package}"
 
 
+def integration_files(base: Path) -> list:
+    """Each integration crate's Rust src/ and runtime SQL."""
+    files = []
+    for package in sorted(p for p in base.iterdir() if p.is_dir()):
+        if not (package / "Cargo.toml").is_file():
+            continue
+        if (package / "src").is_dir():
+            files += sorted((package / "src").rglob("*.rs"))
+        if (package / "sql").is_dir():
+            files += sorted((package / "sql").rglob("*.sql"))
+    files = [
+        path
+        for path in files
+        if not any(part in SKIP_DIRS for part in path.relative_to(base).parts)
+    ]
+    rust = [path for path in files if path.suffix == ".rs"]
+    excluded = test_only_files(rust)
+    return [path for path in files if path not in excluded]
+
+
+def integration_crate(base: Path, path: Path) -> str:
+    return path.relative_to(base).parts[0]
+
+
 def crate_of(root: Path, scope: str, path: Path) -> str:
     base = scope_base(root, scope)
     if scope == "sdk":
         return sdk_crate(base, path)
     if scope == "dsh":
         return dsh_crate(base, path)
+    if scope == "integrations":
+        return integration_crate(base, path)
     parts = path.relative_to(root).parts
     return parts[2] if scope == "core" else parts[1]
 
@@ -406,6 +466,8 @@ def scope_files(root: Path, scope: str) -> list:
         return sdk_files(base)
     if scope == "dsh":
         return dsh_files(base)
+    if scope == "integrations":
+        return integration_files(base)
     files = []
     for path in sorted(base.rglob("*")):
         if not path.is_file():
