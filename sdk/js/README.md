@@ -230,6 +230,85 @@ keeps its markers in that Workspace; inspect them through ordinary bounded
 `exec` commands and Commit each command. An omitted diagnostic is not a clean
 merge, and a failed/unknown operation must be inspected before a new operation.
 
+## rutis plugin
+
+The SDK is also a [rutis](https://github.com/arcships/rutis) plugin at
+`@layerfs/sdk/rutis`. One row provides one project's public SDK surface as
+named services; consumers do not need to know LayerFS's process layout. The
+boundary and open review questions are in
+[the design note](../../docs/roadmap/1.0/rutis-plugin.md).
+
+| Service | Methods |
+| --- | --- |
+| `layerfs` | `info()`, `call(method, args)` |
+| `layerfs.project` | `init`, `listBranches` |
+| `layerfs.fs` | `read`, `list`, `stat`, `grep`, `glob`, `diffFiles`, `blame`, `write`, `edit`, `apply`, `mkdir`, `rm`, `cp`, `mv` |
+| `layerfs.branch` | `fork`, `listCommits`, `diffCommits`, `diffBranches`, `merge`, `publish` |
+| `layerfs.workspace` | `mount`, `exec`, `status`, `commit`, `unmount` |
+
+Group methods are camelCase aliases of the SDK's snake_case methods;
+`layerfs.call` reaches the SDK's Store method table (`fs.*`, `branch.*`,
+`project.list_branches`). Use `layerfs.project.init` and
+`layerfs.workspace.*` for the other routes.
+
+```json
+{
+  "format": 1,
+  "runtimes": { "node": { "project": ".", "restart": "on-failure" } },
+  "rows": [
+    {
+      "id": "layerfs",
+      "name": "@layerfs/sdk/rutis",
+      "config": {
+        "project": "website",
+        "home": "/srv/layerfs/home",
+        "storePath": "/var/lib/docker/volumes/layerfs-store/_data/global/store.sqlite",
+        "deploy": {
+          "docker": "/var/run/docker.sock",
+          "image": "sha256:...",
+          "volume": "layerfs-store",
+          "daemon": "/srv/layerfs/layerfs-daemon"
+        }
+      }
+    },
+    { "id": "agent", "name": "./agent.js", "inject": ["layerfs.fs", "layerfs.workspace"] }
+  ]
+}
+```
+
+`home` and `deploy` are applied to the documented `LAYERFS_*` environment
+variables; the SDK constructor already reads `storePath`, `storePolicy` and
+`trace` from options. A Node runtime has one environment, so **one rutis Node
+runtime serves one project**; give a second project another runtime (restart
+the runtime to change a row's project). The plugin refuses to overwrite a
+different value already in the environment.
+
+The SDK is currently installed from this checkout, as the dsh bundle does
+(`"@layerfs/sdk": "link:<repo>/sdk/js"`), so the row name
+`@layerfs/sdk/rutis` resolves in the runtime's project. The rutis Node runtime
+requires Node 22; the SDK package's own engine floor stays Node 20.
+
+The plugin runs only on Linux because Store calls are Linux-only. On macOS,
+run it in a Linux rutis remote runtime and let the host link to it.
+
+`apply` does not open the Store: `project.init` must be able to install it
+first. The first Store call opens it, and unload closes it. Unload does not
+Commit or unmount: a Workspace is ended only by an explicit
+`workspace.unmount`. Calls to one Workspace run in order; calls to different
+Workspaces run in parallel.
+
+The service exposes `workspace.exec` without the SDK's Writable sinks, so its
+stdout and stderr cross as text. Use a dedicated executor or a file-based route
+for output too large to return in one call. With `events.calls: true`, each
+call emits `layerfs/call` with `{ method, ok, ms, code? }`; no arguments or
+file content are included.
+
+```sh
+# in this package
+npm install --no-package-lock
+node --test test/rutis.mjs test/rutis_host.mjs
+```
+
 ## Internal operator
 
 ```js
