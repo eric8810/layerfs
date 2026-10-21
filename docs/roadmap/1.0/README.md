@@ -23,6 +23,12 @@ inputs to 1.0.0 unless a 1.0.0 issue picks them up explicitly.
 | [#333](https://github.com/Ephemeral-AI-Lab/layerfs/issues/333) | Troubleshooting telemetry: SDK call trace, phase timing, observed daemon diagnostics | Trace, Commit/mount/merge phase timing and joined daemon records on and off tested; docs and overhead recorded |
 | [#334](https://github.com/Ephemeral-AI-Lab/layerfs/issues/334) | SDK skill verified live; an e-commerce project built on LayerFS by a bug-fixing agent, then by a fresh agent | Every skill example captured live; both builds finished or blockers recorded; storage and per-operation speed results written ([plan](../../../core/docs/issues/334/README.md)) |
 
+## Integrations under review
+
+- [LayerFS as a rutis plugin](rutis-plugin.md): a service adapter over the
+  JavaScript SDK; proposal and implementation recorded together, not a released
+  contract.
+
 ## Decisions still needed from the owner
 
 - [ ] **Compatibility promise.** 1.0.0 follows stable semantic versioning (see
