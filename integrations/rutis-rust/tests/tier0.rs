@@ -110,6 +110,32 @@ async fn opens_an_installed_store_and_runs_the_public_table() {
 }
 
 #[tokio::test]
+async fn a_closed_service_can_be_reopened() {
+    let (_root, config, _manifest) = fixture();
+    let first = LayerFs::new(config.clone()).unwrap();
+    let value = first
+        .call(
+            "fs.read".into(),
+            json!({ "branch": "main", "path": "/README.md" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(value["text"], "hello\n");
+    first.close().await.unwrap();
+
+    let second = LayerFs::new(config).unwrap();
+    let value = second
+        .call(
+            "fs.read".into(),
+            json!({ "branch": "main", "path": "/README.md" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(value["text"], "hello\n");
+    second.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn missing_installed_manifest_is_no_store() {
     let (_root, config, manifest) = fixture();
     write_record(

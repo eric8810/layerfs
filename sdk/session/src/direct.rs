@@ -16,7 +16,7 @@ use crate::outcome::{failed, refused, Outcome};
 use crate::registry::lock;
 use layerfs_bridge::control::{SdkCall, SdkRefusal, SdkValue};
 use layerfs_store_service::{telemetry, OpenRefusal, StoreService};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -25,6 +25,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 struct Opened {
     service: Option<StoreService>,
     clients: AtomicUsize,
+    /// The Store path this owner opened; used to leave the closing set.
+    store: PathBuf,
     /// This service's private overlay directory.
     directory: Option<PathBuf>,
 }
@@ -59,10 +61,17 @@ impl Drop for Opened {
         if let Some(directory) = directory {
             let _ = std::fs::remove_dir_all(directory);
         }
+        if let Ok(mut closing) = CLOSING.lock() {
+            closing.remove(&self.store);
+        }
     }
 }
 
+/// The live owner of each path.
 static STORES: LazyLock<Mutex<BTreeMap<PathBuf, Arc<Opened>>>> = LazyLock::new(Default::default);
+/// Paths whose last client released while a call still held the owner. A new
+/// open is refused `Busy` until that owner drops and clears the entry.
+static CLOSING: LazyLock<Mutex<BTreeSet<PathBuf>>> = LazyLock::new(Default::default);
 static DIRECTORIES: AtomicU64 = AtomicU64::new(0);
 
 /// The Store path a call names.
@@ -95,6 +104,7 @@ fn open(store: &Path, args: &SdkValue) -> Result<Arc<Opened>, SdkRefusal> {
         Ok(service) => Ok(Arc::new(Opened {
             service: Some(service),
             clients: AtomicUsize::new(0),
+            store: store.to_owned(),
             directory: Some(directory),
         })),
         Err(refusal) => {
@@ -112,8 +122,14 @@ fn open(store: &Path, args: &SdkValue) -> Result<Arc<Opened>, SdkRefusal> {
 pub fn acquire(args: &SdkValue) -> Outcome {
     let store = path(args)?;
     let mut stores = lock(&STORES)?;
-    let opened = match stores.get(&store) {
-        Some(opened) => Arc::clone(opened),
+    if lock(&CLOSING)?.contains(&store) {
+        return Err(refused(
+            "Busy",
+            "the Store is closing; its in-flight calls have not ended",
+        ));
+    }
+    let opened = match stores.get(&store).cloned() {
+        Some(opened) => opened,
         None => {
             let opened = open(&store, args)?;
             stores.insert(store.clone(), Arc::clone(&opened));
@@ -146,6 +162,8 @@ pub fn release(args: &SdkValue) -> Outcome {
                 SdkValue::Int((previous - 1) as i64),
             )]));
         }
+        // A new open is refused until the last in-flight owner drops.
+        lock(&CLOSING)?.insert(store.clone());
         stores.remove(&store);
         opened
     };

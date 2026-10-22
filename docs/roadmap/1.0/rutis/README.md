@@ -1,6 +1,7 @@
 # Rust rutis plugin: minimal tiers
 
-> **Status:** Proposal; target LayerFS 1.0.0; not a released contract.
+> **Status:** Tiers 0 and 1 implemented, unreleased; Tier 2 is a proposal.
+> Target LayerFS 1.0.0; not a released contract.
 
 Only three things are added, in this order:
 

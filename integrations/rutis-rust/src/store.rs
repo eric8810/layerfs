@@ -168,6 +168,7 @@ impl LayerFs {
     pub async fn workspace_exec(&self, args: Value) -> Result<Value, LayerFsError> {
         let _inflight = self.enter()?;
         self.ensure_deploy("workspace.exec")?;
+        check_exec_args(&args)?;
         let lane = self.lane(&args);
         let _lane = lane.lock_owned().await;
         let (args, sink) = take_sink(args)?;
@@ -198,13 +199,7 @@ impl LayerFs {
             state.closed = true;
         }
         // Calls that entered before the flag finish before the Store goes.
-        loop {
-            let notified = self.inner.drained.notified();
-            if self.state().inflight == 0 {
-                break;
-            }
-            notified.await;
-        }
+        wait_drained(&self.inner.state, &self.inner.drained).await;
         let _opening = self.inner.opening.lock().await;
         if !self.inner.opened.swap(false, Ordering::AcqRel) {
             return Ok(());
@@ -333,6 +328,25 @@ impl LayerFs {
             set(&mut fields, "deploy", deploy_value(deploy));
         }
         Ok(SdkValue::Map(fields))
+    }
+}
+
+/// Waits until no call entered before the close; registration precedes the
+/// check so a drain notice cannot be lost between them.
+async fn wait_drained(state: &Mutex<State>, drained: &tokio::sync::Notify) {
+    loop {
+        let notified = drained.notified();
+        let mut notified = std::pin::pin!(notified);
+        notified.as_mut().enable();
+        if state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .inflight
+            == 0
+        {
+            break;
+        }
+        notified.await;
     }
 }
 
@@ -596,6 +610,7 @@ struct Sink {
 }
 
 /// Sink files opened before the command runs, so a bad sink fails first.
+#[derive(Debug)]
 struct OpenedSink {
     stdout: Option<File>,
     stderr: Option<File>,
@@ -622,27 +637,37 @@ impl Sink {
                 ));
             }
         }
+        // A hard-linked pair is rejected above before either file is cleared.
+        for file in [&opened.stdout, &opened.stderr].into_iter().flatten() {
+            file.set_len(0)?;
+        }
         Ok(opened)
     }
 }
 
 fn open_sink(path: &Path) -> Result<File, LayerFsError> {
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
+        // A FIFO or device must not block the worker before its type is known.
         #[cfg(target_os = "linux")]
-        options.custom_flags(libc::O_NOFOLLOW);
-        let file = options.open(path)?;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        Ok(file)
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    #[cfg(not(unix))]
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(LayerFsError::invalid(
+            "a sink path must name a regular file",
+        ));
+    }
+    #[cfg(unix)]
     {
-        options.open(path).map_err(Into::into)
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
+    Ok(file)
 }
 
 /// Releases a spooled output once, even when filling a sink fails.
@@ -721,6 +746,25 @@ fn take_sink(args: Value) -> Result<(Value, Option<Sink>), LayerFsError> {
     Ok((Value::Object(fields), Some(sink)))
 }
 
+/// Validates the text every exec needs before a sink is opened, so a
+/// malformed call cannot truncate the caller's files.
+fn check_exec_args(args: &Value) -> Result<(), LayerFsError> {
+    let Value::Object(fields) = args else {
+        return Err(LayerFsError::invalid("arguments must be an object"));
+    };
+    for name in ["sandbox", "path", "command"] {
+        match fields.get(name) {
+            Some(Value::String(text)) if !text.is_empty() => {}
+            _ => {
+                return Err(LayerFsError::invalid(format!(
+                    "{name} must be a non-empty string"
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
 fn exec_into_sink(args: SdkValue, sink: Sink) -> Result<Value, LayerFsError> {
     let SdkValue::Map(mut fields) = args else {
         return Err(LayerFsError::invalid("arguments must be an object"));
@@ -748,7 +792,14 @@ fn exec_into_sink(args: SdkValue, sink: Sink) -> Result<Value, LayerFsError> {
             Some((_, SdkValue::Text(text))) => Some(text.as_str()),
             _ => None,
         };
-        let bytes = write_stream(file, inline, output.id(), name, output_size(&fields, name))?;
+        let bytes = write_stream(
+            file,
+            inline,
+            output.id(),
+            name,
+            output_size(&fields, name),
+            |args, page| layerfs_session::exec_output(args, page).map_err(Into::into),
+        )?;
         let path = match name {
             "stdout" => sink.stdout.as_deref(),
             _ => sink.stderr.as_deref(),
@@ -800,13 +851,17 @@ fn output_size(fields: &[(String, SdkValue)], name: &str) -> Option<u64> {
     }
 }
 
-fn write_stream(
+fn write_stream<F>(
     file: &mut File,
     inline: Option<&str>,
     output: Option<&str>,
     stream: &str,
     size: Option<u64>,
-) -> Result<u64, LayerFsError> {
+    mut read_page: F,
+) -> Result<u64, LayerFsError>
+where
+    F: FnMut(&SdkValue, &mut [u8]) -> Result<SdkValue, LayerFsError>,
+{
     if let Some(text) = inline {
         file.write_all(text.as_bytes())?;
         let written = text.len() as u64;
@@ -831,7 +886,7 @@ fn write_stream(
             ("stream", SdkValue::text(stream)),
             ("offset", SdkValue::Int(offset as i64)),
         ]);
-        let answer = layerfs_session::exec_output(&args, &mut page)?;
+        let answer = read_page(&args, &mut page)?;
         let length = answer
             .get_int("length")
             .and_then(|length| usize::try_from(length).ok())
@@ -891,20 +946,179 @@ mod tests {
         assert_eq!(output_size(&fields, "other"), None);
     }
 
+    #[tokio::test]
+    async fn close_waiting_observes_a_drain_notice() {
+        let state = Arc::new(Mutex::new(State {
+            closed: true,
+            inflight: 1,
+        }));
+        let drained = Arc::new(tokio::sync::Notify::new());
+        let waiter = {
+            let state = Arc::clone(&state);
+            let drained = Arc::clone(&drained);
+            tokio::spawn(async move { wait_drained(&state, &drained).await })
+        };
+        tokio::task::yield_now().await;
+        state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .inflight = 0;
+        drained.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("drain was observed")
+            .unwrap();
+    }
+
+    fn page_answer(length: usize, end: bool) -> SdkValue {
+        SdkValue::map([
+            ("length", SdkValue::Int(length as i64)),
+            ("end", SdkValue::Bool(end)),
+        ])
+    }
+
+    #[test]
+    fn a_malformed_exec_is_refused_before_a_sink_opens() {
+        let error = check_exec_args(&json!({ "sandbox": "1", "path": "/ws" })).unwrap_err();
+        assert_eq!(error.code(), "InvalidInput");
+        let error = check_exec_args(&json!({
+            "sandbox": "1",
+            "path": "/ws",
+            "command": ""
+        }))
+        .unwrap_err();
+        assert_eq!(error.code(), "InvalidInput");
+    }
+
     #[test]
     fn inline_streams_are_written_and_checked() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("stdout.log");
         let mut file = open_sink(&path).unwrap();
         assert_eq!(
-            write_stream(&mut file, Some("hello"), None, "stdout", Some(5)).unwrap(),
+            write_stream(
+                &mut file,
+                Some("hello"),
+                None,
+                "stdout",
+                Some(5),
+                |_, _| unreachable!(),
+            )
+            .unwrap(),
             5
         );
         drop(file);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
 
         let mut file = open_sink(&path).unwrap();
-        let error = write_stream(&mut file, Some("hello"), None, "stdout", Some(4)).unwrap_err();
+        let error = write_stream(
+            &mut file,
+            Some("hello"),
+            None,
+            "stdout",
+            Some(4),
+            |_, _| unreachable!(),
+        )
+        .unwrap_err();
         assert_eq!(error.code(), "InvalidInput");
+    }
+
+    #[test]
+    fn spooled_pages_are_written_in_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stdout.log");
+        let mut file = open_sink(&path).unwrap();
+        let payload = b"hello world";
+        let result = write_stream(
+            &mut file,
+            None,
+            Some("out"),
+            "stdout",
+            Some(payload.len() as u64),
+            |args, page| {
+                let offset = args.get_int("offset").unwrap() as usize;
+                let length = (payload.len() - offset).min(5);
+                page[..length].copy_from_slice(&payload[offset..offset + length]);
+                Ok(page_answer(length, offset + length == payload.len()))
+            },
+        )
+        .unwrap();
+        assert_eq!(result, payload.len() as u64);
+        drop(file);
+        assert_eq!(std::fs::read(&path).unwrap(), payload);
+    }
+
+    #[test]
+    fn a_spool_that_ends_early_is_an_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stdout.log");
+        let mut file = open_sink(&path).unwrap();
+        let error = write_stream(
+            &mut file,
+            None,
+            Some("out"),
+            "stdout",
+            Some(5),
+            |_, page| {
+                page[..2].copy_from_slice(b"hi");
+                Ok(page_answer(2, true))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "InvalidInput");
+    }
+
+    #[test]
+    fn an_empty_or_oversized_spool_page_is_an_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stdout.log");
+        for (length, end) in [(0, false), (6, false)] {
+            let mut file = open_sink(&path).unwrap();
+            let error = write_stream(&mut file, None, Some("out"), "stdout", Some(5), |_, _| {
+                Ok(page_answer(length, end))
+            })
+            .unwrap_err();
+            assert_eq!(error.code(), "InvalidInput");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_linked_sink_pair_is_rejected_before_it_is_cleared() {
+        let directory = tempfile::tempdir().unwrap();
+        let stdout = directory.path().join("stdout.log");
+        let stderr = directory.path().join("stderr.log");
+        std::fs::write(&stdout, b"keep").unwrap();
+        std::fs::hard_link(&stdout, &stderr).unwrap();
+        let sink = Sink {
+            stdout: Some(stdout.clone()),
+            stderr: Some(stderr),
+        };
+        let error = sink.open().unwrap_err();
+        assert_eq!(error.code(), "InvalidInput");
+        assert_eq!(std::fs::read(&stdout).unwrap(), b"keep");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_symlinked_sink_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let link = directory.path().join("link");
+        std::fs::write(&target, b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(open_sink(&link).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fifo_sink_is_rejected_without_blocking() {
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("fifo");
+        let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: mkfifo reads the NUL-terminated path and mode only.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        assert!(open_sink(&fifo).is_err());
     }
 }
