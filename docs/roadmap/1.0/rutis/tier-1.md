@@ -125,10 +125,11 @@ path must be an existing socket and the daemon path an existing file.
 - Reload: mounted Workspaces remain; a new plugin can list and unmount them.
 - No test over 120 seconds; Docker tests selected individually.
 
-Run at this implementation: Tier 0 (16 tests), Tier 1 without Docker (6
-tests: deployment validation, missing deployment, unknown Sandbox with and
-without a sink, sink argument validation, private-project enforcement),
-`layerfs-session` (8 moved tests: discovery, reclaim and admission),
+Run at this implementation: Tier 0 (16 tests, including a reopen test), Tier
+1 without Docker (8 tests: deployment validation, missing deployment, unknown
+Sandbox with and without a sink, malformed message/sink, Branch-before-start
+ordering, sink argument validation, private-project enforcement),
+`layerfs-session` (8 tests: 6 moved from native plus 2 admission tests),
 JavaScript `packaging/lazy`, `packaging/dispatch`, `test/exec_output.mjs` and
 every `test/trace.mjs` case. The live Docker acceptance items below are
 **NOT_RUN**; no LayerFS image is installed on this host.

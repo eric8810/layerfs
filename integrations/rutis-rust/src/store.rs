@@ -57,7 +57,7 @@ struct State {
 
 struct Inner {
     config: Config,
-    opening: tokio::sync::Mutex<()>,
+    opening: Mutex<()>,
     opened: AtomicBool,
     state: Mutex<State>,
     drained: tokio::sync::Notify,
@@ -100,7 +100,7 @@ impl LayerFs {
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
-                opening: tokio::sync::Mutex::new(()),
+                opening: Mutex::new(()),
                 opened: AtomicBool::new(false),
                 state: Mutex::new(State::default()),
                 drained: tokio::sync::Notify::new(),
@@ -119,13 +119,14 @@ impl LayerFs {
 
     /// Runs one public Store method once.
     pub async fn call(&self, method: String, args: Value) -> Result<Value, LayerFsError> {
-        let _inflight = self.enter()?;
+        let inflight = self.enter()?;
         let method = exact_method(&method)?;
-        self.open_store().await?;
         let args = self.session_args(args)?;
-        let project = self.inner.config.project.clone();
+        let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let args = with_project(args, &project)?;
+            let _inflight = inflight;
+            ensure_store(&inner)?;
+            let args = with_project(args, &inner.config.project)?;
             let value = layerfs_session::dispatch(method, args)?;
             Ok(value::to_json(&value))
         })
@@ -166,26 +167,30 @@ impl LayerFs {
     /// order after it ends, and the result carries the byte counts. Output is
     /// spooled while the command runs; the sink does not hold it back.
     pub async fn workspace_exec(&self, args: Value) -> Result<Value, LayerFsError> {
-        let _inflight = self.enter()?;
+        let inflight = self.enter()?;
         self.ensure_deploy("workspace.exec")?;
         check_exec_args(&args)?;
         let lane = self.lane(&args);
-        let _lane = lane.lock_owned().await;
+        let lane = lane.lock_owned().await;
         let (args, sink) = take_sink(args)?;
         let args = self.session_args(args)?;
-        tokio::task::spawn_blocking(move || match sink {
-            None => {
-                let value = layerfs_session::dispatch("workspace.exec", args)?;
-                if let Some(SdkValue::Text(output)) = value.get("output") {
-                    let release = SdkValue::map([("output", SdkValue::Text(output.clone()))]);
-                    let _ = layerfs_session::dispatch("workspace.exec_release", release);
-                    return Err(LayerFsError::invalid(
-                        "workspace.exec output exceeds the inline window; use a sink",
-                    ));
+        tokio::task::spawn_blocking(move || {
+            let _inflight = inflight;
+            let _lane = lane;
+            match sink {
+                None => {
+                    let value = layerfs_session::dispatch("workspace.exec", args)?;
+                    if let Some(SdkValue::Text(output)) = value.get("output") {
+                        let release = SdkValue::map([("output", SdkValue::Text(output.clone()))]);
+                        let _ = layerfs_session::dispatch("workspace.exec_release", release);
+                        return Err(LayerFsError::invalid(
+                            "workspace.exec output exceeds the inline window; use a sink",
+                        ));
+                    }
+                    Ok(value::to_json(&value))
                 }
-                Ok(value::to_json(&value))
+                Some(sink) => exec_into_sink(args, sink),
             }
-            Some(sink) => exec_into_sink(args, sink),
         })
         .await
         .map_err(|error| LayerFsError::Join(error.to_string()))?
@@ -200,14 +205,19 @@ impl LayerFs {
         }
         // Calls that entered before the flag finish before the Store goes.
         wait_drained(&self.inner.state, &self.inner.drained).await;
-        let _opening = self.inner.opening.lock().await;
-        if !self.inner.opened.swap(false, Ordering::AcqRel) {
-            return Ok(());
-        }
-        let config = self.inner.config.clone();
-        tokio::task::spawn_blocking(move || release_store(&config))
-            .await
-            .map_err(|error| LayerFsError::Join(error.to_string()))?
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let _opening = inner
+                .opening
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !inner.opened.swap(false, Ordering::AcqRel) {
+                return Ok(());
+            }
+            release_store(&inner.config)
+        })
+        .await
+        .map_err(|error| LayerFsError::Join(error.to_string()))?
     }
 
     async fn workspace_call(
@@ -217,18 +227,21 @@ impl LayerFs {
         store: bool,
         lane: bool,
     ) -> Result<Value, LayerFsError> {
-        let _inflight = self.enter()?;
+        let inflight = self.enter()?;
         self.ensure_deploy(method)?;
         let lane = if lane { Some(self.lane(&args)) } else { None };
-        let _lane = match lane {
+        let lane = match lane {
             Some(lane) => Some(lane.lock_owned().await),
             None => None,
         };
-        if store {
-            self.open_store().await?;
-        }
         let args = self.session_args(args)?;
+        let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
+            let _inflight = inflight;
+            let _lane = lane;
+            if store {
+                ensure_store(&inner)?;
+            }
             let value = layerfs_session::dispatch(method, args)?;
             Ok(value::to_json(&value))
         })
@@ -242,24 +255,6 @@ impl LayerFs {
                 "{method} needs deploy.docker, deploy.image, deploy.volume and deploy.daemon"
             )));
         }
-        Ok(())
-    }
-
-    async fn open_store(&self) -> Result<(), LayerFsError> {
-        self.ensure_open()?;
-        if self.inner.opened.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let _opening = self.inner.opening.lock().await;
-        self.ensure_open()?;
-        if self.inner.opened.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let config = self.inner.config.clone();
-        tokio::task::spawn_blocking(move || open_store(&config))
-            .await
-            .map_err(|error| LayerFsError::Join(error.to_string()))??;
-        self.inner.opened.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -280,13 +275,6 @@ impl LayerFs {
         Ok(InFlight {
             inner: Arc::clone(&self.inner),
         })
-    }
-
-    fn ensure_open(&self) -> Result<(), LayerFsError> {
-        if self.state().closed {
-            return Err(LayerFsError::invalid("layerfs service is closed"));
-        }
-        Ok(())
     }
 
     /// One lane per `{sandbox, path}`; different Workspaces run in parallel.
@@ -369,6 +357,23 @@ impl Drop for Inner {
             Err(_) => job(),
         }
     }
+}
+
+/// Opens the Store once per plugin, inside the call's blocking task.
+fn ensure_store(inner: &Inner) -> Result<(), LayerFsError> {
+    if inner.opened.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let _opening = inner
+        .opening
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if inner.opened.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    open_store(&inner.config)?;
+    inner.opened.store(true, Ordering::Release);
+    Ok(())
 }
 
 fn open_store(config: &Config) -> Result<(), LayerFsError> {
@@ -665,14 +670,18 @@ fn open_sink(path: &Path) -> Result<File, LayerFsError> {
         }
         Err(error) => return Err(error.into()),
     };
-    if !file.metadata()?.is_file() {
+    let meta = file.metadata()?;
+    if !meta.is_file() {
         return Err(LayerFsError::invalid(
             "a sink path must name a regular file",
         ));
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if meta.nlink() > 1 {
+            return Err(LayerFsError::invalid("a sink path must not be a hard link"));
+        }
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(file)
@@ -682,7 +691,15 @@ fn open_sink(path: &Path) -> Result<File, LayerFsError> {
 /// inspected.
 #[cfg(target_os = "linux")]
 fn not_regular_open(error: &std::io::Error) -> bool {
-    matches!(error.raw_os_error(), Some(libc::ENXIO) | Some(libc::ENODEV))
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENXIO)
+            | Some(libc::ENODEV)
+            | Some(libc::ELOOP)
+            | Some(libc::EISDIR)
+            | Some(libc::ENOENT)
+            | Some(libc::ENOTDIR)
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -990,6 +1007,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_notification_after_registration_is_not_lost() {
+        let drained = tokio::sync::Notify::new();
+        let notified = drained.notified();
+        let mut notified = std::pin::pin!(notified);
+        notified.as_mut().enable();
+        drained.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut notified)
+            .await
+            .expect("registered waiter observed the notification");
+    }
+
+    #[tokio::test]
     async fn close_waiting_observes_a_drain_notice() {
         let state = Arc::new(Mutex::new(State {
             closed: true,
@@ -1060,6 +1089,14 @@ mod tests {
         );
         drop(file);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
 
         let mut file = open_sink(&path).unwrap();
         let error = write_stream(
@@ -1150,6 +1187,30 @@ mod tests {
         assert_eq!(std::fs::read(&stdout).unwrap(), b"keep");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_single_hard_link_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("linked.log");
+        let other = directory.path().join("other.log");
+        std::fs::write(&path, b"keep").unwrap();
+        std::fs::hard_link(&path, &other).unwrap();
+        let error = open_sink(&path).unwrap_err();
+        assert_eq!(error.code(), "InvalidInput");
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sink_path_errors_are_invalid_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing").join("out.log");
+        assert_eq!(open_sink(&missing).unwrap_err().code(), "InvalidInput");
+        let folder = directory.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        assert_eq!(open_sink(&folder).unwrap_err().code(), "InvalidInput");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn a_symlinked_sink_is_rejected() {
@@ -1158,7 +1219,8 @@ mod tests {
         let link = directory.path().join("link");
         std::fs::write(&target, b"keep").unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(open_sink(&link).is_err());
+        let error = open_sink(&link).unwrap_err();
+        assert_eq!(error.code(), "InvalidInput");
         assert_eq!(std::fs::read(&target).unwrap(), b"keep");
     }
 

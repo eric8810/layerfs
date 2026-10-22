@@ -52,7 +52,12 @@ fn place(args: &SdkValue, project: &Path) -> Result<Arc<SandboxState>, SdkRefusa
             Ok(state) => return Ok(state),
             Err(refusal) => match crate::discovery::gone_container(&refusal) {
                 Some((container, stopped)) => {
-                    crate::sandbox::reclaim(args, &id, container, stopped)?;
+                    match crate::sandbox::reclaim(args, &id, container, stopped) {
+                        Ok(_) => {}
+                        // another process reclaimed it meanwhile
+                        Err(refusal) if refusal.code == "NoSuchSandbox" => continue,
+                        Err(refusal) => return Err(refusal),
+                    }
                 }
                 None => return Err(refusal),
             },
@@ -107,7 +112,33 @@ pub(crate) fn mount(args: &SdkValue) -> Outcome {
         let image = state.runtime.request().image.as_str();
         fields.push(("image".to_owned(), SdkValue::text(image)));
     }
-    crate::discovery::save_workspace(&state, &mounted, branch)?;
+    if let Err(mut refusal) = crate::discovery::save_workspace(&state, &mounted, branch) {
+        // The daemon already mounted it; try to release it once and keep the
+        // token/path in the error so the failure is attributable.
+        let token = mounted.bound.token;
+        let _ = crate::trace::control(&state.controls).and_then(|mut control| {
+            workspace(&mut control)
+                .unmount_checked(token, true)
+                .map_err(failed)
+        });
+        let mut detail = match refusal.detail {
+            SdkValue::Map(fields) => fields,
+            other => vec![("cause".to_owned(), other)],
+        };
+        detail.push((
+            "workspace".to_owned(),
+            SdkValue::Text(layerfs_bridge::sdk_values::hex(
+                &token.workspace.to_bytes(),
+            )),
+        ));
+        detail.push(("namespace".to_owned(), SdkValue::Int(token.namespace)));
+        detail.push((
+            "path".to_owned(),
+            SdkValue::Text(mounted.ready.directory.clone()),
+        ));
+        refusal.detail = SdkValue::Map(detail);
+        return Err(refusal);
+    }
     lock(&state.mounts)?.insert(
         mounted.ready.directory.clone(),
         Mount {
@@ -161,6 +192,8 @@ pub(crate) fn list(args: &SdkValue) -> Outcome {
                     Ok(_) => {}
                     // started again under the number meanwhile
                     Err(refusal) if refusal.code == "Busy" => items.push(item),
+                    // another process reclaimed it meanwhile
+                    Err(refusal) if refusal.code == "NoSuchSandbox" => {}
                     Err(refusal) => return Err(refusal),
                 }
             }

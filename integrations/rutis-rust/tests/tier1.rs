@@ -131,6 +131,43 @@ async fn an_unknown_sandbox_does_not_truncate_a_sink() {
 }
 
 #[tokio::test]
+async fn mount_checks_the_branch_before_starting_a_sandbox() {
+    let (root, config, _manifest) = fixture();
+    let config = deployed(config, root.path());
+    let layerfs = LayerFs::new(config.clone()).unwrap();
+    let error = layerfs
+        .workspace_mount(json!({ "branch": "missing" }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "NoSuchBranch");
+    layerfs.close().await.unwrap();
+    support::cleanup(&config);
+}
+
+#[tokio::test]
+async fn a_bad_message_does_not_truncate_a_sink() {
+    let (root, config, _manifest) = fixture();
+    let config = deployed(config, root.path());
+    let layerfs = LayerFs::new(config.clone()).unwrap();
+    let sink = root.path().join("stdout.log");
+    std::fs::write(&sink, b"keep").unwrap();
+    let error = layerfs
+        .workspace_exec(json!({
+            "sandbox": "1",
+            "path": "/ws",
+            "command": "true",
+            "message": 1,
+            "sink": { "stdout": sink }
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "InvalidInput");
+    assert_eq!(std::fs::read(&sink).unwrap(), b"keep");
+    layerfs.close().await.unwrap();
+    support::cleanup(&config);
+}
+
+#[tokio::test]
 async fn exec_sink_requires_absolute_paths() {
     let (root, config, _manifest) = fixture();
     let config = deployed(config, root.path());

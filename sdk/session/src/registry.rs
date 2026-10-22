@@ -12,8 +12,9 @@ use layerfs_api::MountedWorkspace;
 use layerfs_bridge::control::{SdkRefusal, SdkValue, WorkspaceToken};
 use layerfs_bridge::provision::StoreManifest;
 use layerfs_sandbox::{backend::docker::Sandbox, CommandIdentity};
-use std::collections::BTreeMap;
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 
 /// One project, read from or saved to its home entry.
 pub(crate) struct Project {
@@ -56,8 +57,24 @@ pub(crate) struct SandboxState {
 pub(crate) static INITS: LazyLock<Mutex<BTreeMap<String, Arc<layerfs_api::InitCounters>>>> =
     LazyLock::new(Default::default);
 /// This process's live Sandboxes, by their record directory.
-pub(crate) static SANDBOXES: LazyLock<Mutex<BTreeMap<std::path::PathBuf, Arc<SandboxState>>>> =
+pub(crate) static SANDBOXES: LazyLock<Mutex<BTreeMap<PathBuf, Arc<SandboxState>>>> =
     LazyLock::new(Default::default);
+/// Directories whose records one thread is reopening; other first calls wait
+/// for that reopen instead of opening the same Sandbox twice.
+static REOPENING: LazyLock<(Mutex<BTreeSet<PathBuf>>, Condvar)> = LazyLock::new(Default::default);
+
+struct Reopening(PathBuf);
+
+impl Drop for Reopening {
+    fn drop(&mut self) {
+        let (opening_lock, freed) = &*REOPENING;
+        let mut opening = opening_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        opening.remove(&self.0);
+        freed.notify_all();
+    }
+}
 
 /// A lock, refused when a holder panicked.
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, SdkRefusal> {
@@ -79,15 +96,25 @@ pub(crate) fn text<'a>(args: &'a SdkValue, name: &str) -> Result<&'a str, SdkRef
 /// [`sandbox_refreshed`].
 pub(crate) fn sandbox(args: &SdkValue) -> Result<Arc<SandboxState>, SdkRefusal> {
     let directory = crate::discovery::sandbox_dir(args, text(args, "sandbox")?)?;
-    let existing = lock(&SANDBOXES)?.get(&directory).cloned();
-    match existing {
-        Some(state) => Ok(state),
-        None => {
-            let state = crate::discovery::reopen(args)?;
-            lock(&SANDBOXES)?.insert(directory, state.clone());
-            Ok(state)
+    {
+        let (opening_lock, freed) = &*REOPENING;
+        let mut opening = opening_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while opening.contains(&directory) {
+            opening = freed
+                .wait(opening)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
+        if let Some(state) = lock(&SANDBOXES)?.get(&directory).cloned() {
+            return Ok(state);
+        }
+        opening.insert(directory.clone());
     }
+    let _reopening = Reopening(directory.clone());
+    let state = crate::discovery::reopen(args)?;
+    lock(&SANDBOXES)?.insert(directory, state.clone());
+    Ok(state)
 }
 
 /// The Sandbox `args` name when its container still runs it: this
