@@ -104,6 +104,9 @@ path must be an existing socket and the daemon path an existing file.
   implicit unmount or retry. A failed attach leaves a bound Workspace whose
   token is in the error data; there is no path-based unmount for it, and it
   is released when its Sandbox/daemon ends.
+- If the local workspace record cannot be written after the daemon mounted
+  it, the call attempts one unmount and returns the original failure with the
+  token, namespace and path in its detail.
 - Conflict, dirty unmount and unknown outcomes keep their exact code/data.
 - A lost host is not proof that a command or descendant ended.
 
@@ -129,7 +132,7 @@ Run at this implementation: Tier 0 (16 tests, including a reopen test), Tier
 1 without Docker (8 tests: deployment validation, missing deployment, unknown
 Sandbox with and without a sink, malformed message/sink, Branch-before-start
 ordering, sink argument validation, private-project enforcement),
-`layerfs-session` (8 tests: 6 moved from native plus 2 admission tests),
+`layerfs-session` (9 tests: 7 moved/new plus 2 admission tests),
 JavaScript `packaging/lazy`, `packaging/dispatch`, `test/exec_output.mjs` and
 every `test/trace.mjs` case. The live Docker acceptance items below are
 **NOT_RUN**; no LayerFS image is installed on this host.

@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// One opened Store and the clients that hold it.
 struct Opened {
@@ -88,12 +89,17 @@ fn path(args: &SdkValue) -> Result<PathBuf, SdkRefusal> {
 /// Opens the Store at `store` for this process, or refuses.
 fn open(store: &Path, args: &SdkValue) -> Result<Arc<Opened>, SdkRefusal> {
     let project = crate::discovery::project(args)?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
     let directory = std::env::temp_dir().join(format!(
-        "layerfs-store-{}-{}",
+        "layerfs-store-{}-{}-{}",
         std::process::id(),
+        nanos,
         DIRECTORIES.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::create_dir(&directory).map_err(failed)?;
+    private_dir(&directory)?;
     let opened = StoreService::open_direct(
         store,
         &project.manifest.binding,
@@ -115,6 +121,21 @@ fn open(store: &Path, args: &SdkValue) -> Result<Arc<Opened>, SdkRefusal> {
                 OpenRefusal::Failed(reason) => refused("Failed", reason),
             })
         }
+    }
+}
+
+fn private_dir(path: &Path) -> Result<(), SdkRefusal> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(path)
+            .map_err(failed)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(path).map_err(failed)
     }
 }
 

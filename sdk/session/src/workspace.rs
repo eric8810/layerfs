@@ -54,8 +54,12 @@ fn place(args: &SdkValue, project: &Path) -> Result<Arc<SandboxState>, SdkRefusa
                 Some((container, stopped)) => {
                     match crate::sandbox::reclaim(args, &id, container, stopped) {
                         Ok(_) => {}
-                        // another process reclaimed it meanwhile
-                        Err(refusal) if refusal.code == "NoSuchSandbox" => continue,
+                        // reclaimed meanwhile, or restarted under the number
+                        Err(refusal)
+                            if matches!(refusal.code.as_str(), "NoSuchSandbox" | "Busy") =>
+                        {
+                            continue
+                        }
                         Err(refusal) => return Err(refusal),
                     }
                 }
@@ -127,9 +131,7 @@ pub(crate) fn mount(args: &SdkValue) -> Outcome {
         };
         detail.push((
             "workspace".to_owned(),
-            SdkValue::Text(layerfs_bridge::sdk_values::hex(
-                &token.workspace.to_bytes(),
-            )),
+            SdkValue::Text(layerfs_bridge::sdk_values::hex(&token.workspace.to_bytes())),
         ));
         detail.push(("namespace".to_owned(), SdkValue::Int(token.namespace)));
         detail.push((
@@ -267,8 +269,15 @@ pub(crate) fn unmount(args: &SdkValue) -> Outcome {
     let answer = workspace(&mut *crate::trace::control(&state.controls)?)
         .unmount_checked(token, args.get_bool("discard"))
         .map_err(operation)?;
-    let value = values::unmounted(&answer)?;
-    std::fs::remove_file(crate::discovery::workspace_file(&state, token)).map_err(failed)?;
+    // The daemon already unmounted it: always drop the cache, and remove the
+    // record even if converting the answer fails.
+    let record = std::fs::remove_file(crate::discovery::workspace_file(&state, token));
     lock(&state.mounts)?.remove(path);
+    let value = values::unmounted(&answer)?;
+    if let Err(error) = record {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(failed(error));
+        }
+    }
     Ok(value)
 }

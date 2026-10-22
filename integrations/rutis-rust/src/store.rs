@@ -229,6 +229,7 @@ impl LayerFs {
     ) -> Result<Value, LayerFsError> {
         let inflight = self.enter()?;
         self.ensure_deploy(method)?;
+        check_optional_bools(&args, &["force", "discard"])?;
         let lane = if lane { Some(self.lane(&args)) } else { None };
         let lane = match lane {
             Some(lane) => Some(lane.lock_owned().await),
@@ -783,6 +784,20 @@ fn take_sink(args: Value) -> Result<(Value, Option<Sink>), LayerFsError> {
     Ok((Value::Object(fields), Some(sink)))
 }
 
+/// Rejects a non-boolean optional flag instead of treating it as false.
+fn check_optional_bools(args: &Value, names: &[&str]) -> Result<(), LayerFsError> {
+    let Value::Object(fields) = args else {
+        return Err(LayerFsError::invalid("arguments must be an object"));
+    };
+    for name in names {
+        match fields.get(*name) {
+            None | Some(Value::Null) | Some(Value::Bool(_)) => {}
+            Some(_) => return Err(LayerFsError::invalid(format!("{name} must be a boolean"))),
+        }
+    }
+    Ok(())
+}
+
 /// Validates the text every exec needs before a sink is opened, so a
 /// malformed call cannot truncate the caller's files.
 fn check_exec_args(args: &Value) -> Result<(), LayerFsError> {
@@ -799,14 +814,14 @@ fn check_exec_args(args: &Value) -> Result<(), LayerFsError> {
             }
         }
     }
-    if fields
-        .get("background")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err(LayerFsError::invalid(
-            "background launch requires the operator process table",
-        ));
+    match fields.get("background") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => {}
+        Some(Value::Bool(true)) => {
+            return Err(LayerFsError::invalid(
+                "background launch requires the operator process table",
+            ))
+        }
+        Some(_) => return Err(LayerFsError::invalid("background must be a boolean")),
     }
     if let Some(message) = fields.get("message") {
         match message {
@@ -1060,6 +1075,7 @@ mod tests {
         }))
         .unwrap_err();
         assert_eq!(error.code(), "InvalidInput");
+        assert!(check_optional_bools(&json!({ "force": "true" }), &["force"]).is_err());
         for extra in [json!({ "message": 1 }), json!({ "background": true })] {
             let mut args = json!({ "sandbox": "1", "path": "/ws", "command": "true" });
             args.as_object_mut()

@@ -15,6 +15,7 @@ use layerfs_sandbox::{backend::docker::Sandbox, CommandIdentity};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 /// One project, read from or saved to its home entry.
 pub(crate) struct Project {
@@ -101,10 +102,19 @@ pub(crate) fn sandbox(args: &SdkValue) -> Result<Arc<SandboxState>, SdkRefusal> 
         let mut opening = opening_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let deadline = Instant::now() + Duration::from_secs(60);
         while opening.contains(&directory) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(refused(
+                    "Busy",
+                    "another call is still reopening this Sandbox",
+                ));
+            }
             opening = freed
-                .wait(opening)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .wait_timeout(opening, remaining)
+                .map(|(opening, _)| opening)
+                .unwrap_or_else(|poisoned| poisoned.into_inner().0);
         }
         if let Some(state) = lock(&SANDBOXES)?.get(&directory).cloned() {
             return Ok(state);
