@@ -189,6 +189,9 @@ impl Controls {
                     Ok(control) => return Ok((self.lease(control), started.elapsed())),
                     Err(refusal) => {
                         pool.open -= 1;
+                        // An opener just failed; every waiter must look again,
+                        // including those waiting on the last connection.
+                        self.freed.notify_all();
                         if pool.open == 0 {
                             return Err(refusal);
                         }

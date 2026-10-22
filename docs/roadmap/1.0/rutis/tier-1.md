@@ -101,7 +101,9 @@ path must be an existing socket and the daemon path an existing file.
 ## Failure
 
 - Mount failure keeps its acknowledged binding and original failure; no
-  implicit unmount or retry.
+  implicit unmount or retry. A failed attach leaves a bound Workspace whose
+  token is in the error data; there is no path-based unmount for it, and it
+  is released when its Sandbox/daemon ends.
 - Conflict, dirty unmount and unknown outcomes keep their exact code/data.
 - A lost host is not proof that a command or descendant ended.
 
@@ -123,13 +125,13 @@ path must be an existing socket and the daemon path an existing file.
 - Reload: mounted Workspaces remain; a new plugin can list and unmount them.
 - No test over 120 seconds; Docker tests selected individually.
 
-Run at this implementation: Tier 0 (16 tests), Tier 1 without Docker (5
-tests: deployment validation, missing deployment, unknown Sandbox, sink
-argument validation, private-project enforcement), `layerfs-session` (8 moved
-tests: discovery, reclaim and admission), JavaScript `packaging/lazy`,
-`packaging/dispatch`, `test/exec_output.mjs` and every `test/trace.mjs` case.
-The live Docker acceptance items below are **NOT_RUN**; no LayerFS image is
-installed on this host.
+Run at this implementation: Tier 0 (16 tests), Tier 1 without Docker (6
+tests: deployment validation, missing deployment, unknown Sandbox with and
+without a sink, sink argument validation, private-project enforcement),
+`layerfs-session` (8 moved tests: discovery, reclaim and admission),
+JavaScript `packaging/lazy`, `packaging/dispatch`, `test/exec_output.mjs` and
+every `test/trace.mjs` case. The live Docker acceptance items below are
+**NOT_RUN**; no LayerFS image is installed on this host.
 
 ## Risks
 

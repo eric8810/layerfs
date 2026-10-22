@@ -47,6 +47,19 @@ fn run(
     Ok((code, stdout, stderr))
 }
 
+/// Validates the Sandbox, mount path and command before a caller opens an
+/// output sink; performs no command and no mutation.
+pub fn preflight(args: &SdkValue) -> Outcome {
+    let state = sandbox(args)?;
+    let path = text(args, "path")?;
+    let command = text(args, "command")?;
+    if command.is_empty() {
+        return Err(refused("InvalidInput", "command must not be empty"));
+    }
+    let _ = state.directory(path)?;
+    Ok(SdkValue::Null)
+}
+
 /// `workspace.exec(ws, command, { background?, spool? })`; with
 /// `background`, `operator.process.start(ws, command)`.
 ///

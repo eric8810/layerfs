@@ -109,6 +109,28 @@ async fn unknown_sandbox_is_refused_before_any_engine_call() {
 }
 
 #[tokio::test]
+async fn an_unknown_sandbox_does_not_truncate_a_sink() {
+    let (root, config, _manifest) = fixture();
+    let config = deployed(config, root.path());
+    let layerfs = LayerFs::new(config.clone()).unwrap();
+    let sink = root.path().join("stdout.log");
+    std::fs::write(&sink, b"keep").unwrap();
+    let error = layerfs
+        .workspace_exec(json!({
+            "sandbox": "1",
+            "path": "/ws",
+            "command": "true",
+            "sink": { "stdout": sink }
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "NoSuchSandbox");
+    assert_eq!(std::fs::read(&sink).unwrap(), b"keep");
+    layerfs.close().await.unwrap();
+    support::cleanup(&config);
+}
+
+#[tokio::test]
 async fn exec_sink_requires_absolute_paths() {
     let (root, config, _manifest) = fixture();
     let config = deployed(config, root.path());

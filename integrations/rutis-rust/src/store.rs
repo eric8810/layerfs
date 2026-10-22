@@ -656,7 +656,15 @@ fn open_sink(path: &Path) -> Result<File, LayerFsError> {
         #[cfg(target_os = "linux")]
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let file = options.open(path)?;
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if not_regular_open(&error) => {
+            return Err(LayerFsError::invalid(
+                "a sink path must name a regular file",
+            ))
+        }
+        Err(error) => return Err(error.into()),
+    };
     if !file.metadata()?.is_file() {
         return Err(LayerFsError::invalid(
             "a sink path must name a regular file",
@@ -668,6 +676,18 @@ fn open_sink(path: &Path) -> Result<File, LayerFsError> {
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(file)
+}
+
+/// A FIFO or device that refuses a non-blocking writer before its type can be
+/// inspected.
+#[cfg(target_os = "linux")]
+fn not_regular_open(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::ENXIO) | Some(libc::ENODEV))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn not_regular_open(_: &std::io::Error) -> bool {
+    false
 }
 
 /// Releases a spooled output once, even when filling a sink fails.
@@ -762,6 +782,27 @@ fn check_exec_args(args: &Value) -> Result<(), LayerFsError> {
             }
         }
     }
+    if fields
+        .get("background")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(LayerFsError::invalid(
+            "background launch requires the operator process table",
+        ));
+    }
+    if let Some(message) = fields.get("message") {
+        match message {
+            Value::Null => {}
+            Value::String(text) => {
+                let mut meta = layerfs_history::CommitMeta::new(layerfs_history::CommitVia::Files);
+                meta.message = Some(text.clone());
+                meta.check()
+                    .map_err(|error| LayerFsError::invalid(error.to_string()))?;
+            }
+            _ => return Err(LayerFsError::invalid("message must be text")),
+        }
+    }
     Ok(())
 }
 
@@ -769,6 +810,8 @@ fn exec_into_sink(args: SdkValue, sink: Sink) -> Result<Value, LayerFsError> {
     let SdkValue::Map(mut fields) = args else {
         return Err(LayerFsError::invalid("arguments must be an object"));
     };
+    // Resolve the Sandbox and mount before any sink file is touched.
+    layerfs_session::exec_preflight(&SdkValue::Map(fields.clone()))?;
     let mut files = sink.open()?;
     set(&mut fields, "spool", SdkValue::Bool(true));
     let result = layerfs_session::dispatch("workspace.exec", SdkValue::Map(fields))?;
@@ -988,6 +1031,14 @@ mod tests {
         }))
         .unwrap_err();
         assert_eq!(error.code(), "InvalidInput");
+        for extra in [json!({ "message": 1 }), json!({ "background": true })] {
+            let mut args = json!({ "sandbox": "1", "path": "/ws", "command": "true" });
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let error = check_exec_args(&args).unwrap_err();
+            assert_eq!(error.code(), "InvalidInput");
+        }
     }
 
     #[test]
@@ -1119,6 +1170,7 @@ mod tests {
         let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
         // SAFETY: mkfifo reads the NUL-terminated path and mode only.
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
-        assert!(open_sink(&fifo).is_err());
+        let error = open_sink(&fifo).unwrap_err();
+        assert_eq!(error.code(), "InvalidInput");
     }
 }
