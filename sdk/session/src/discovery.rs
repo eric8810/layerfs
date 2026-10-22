@@ -1,6 +1,6 @@
 //! Private, permission-authorized project and Sandbox discovery. No mutation replay.
 use crate::{
-    job::{failed, refused},
+    outcome::{failed, refused},
     registry::{self, Mount, Process, Project, SandboxState},
 };
 use layerfs_api::{internal::workspace, BoundWorkspace, MountedWorkspace};
@@ -94,13 +94,17 @@ pub(crate) fn sandbox_dir(args: &SdkValue, id: &str) -> Result<PathBuf> {
 pub(crate) fn sandbox_ids(args: &SdkValue) -> Result<Vec<String>> {
     let mut ids = Vec::new();
     for item in fs::read_dir(sandboxes(args)?).map_err(failed)? {
-        let name = item.map_err(failed)?.file_name();
-        if let Some(n) = name.to_str().and_then(number) {
+        if let Some(n) = item.map_err(failed)?.file_name().to_str().and_then(number) {
             ids.push(n);
         }
     }
+    Ok(sort_ids(ids))
+}
+
+/// Numeric Sandbox order: 1, 2, ..., 10, not lexicographic 1, 10, 2.
+fn sort_ids(mut ids: Vec<u32>) -> Vec<String> {
     ids.sort_unstable();
-    Ok(ids.into_iter().map(|n| n.to_string()).collect())
+    ids.into_iter().map(|id| id.to_string()).collect()
 }
 /// Claims the lowest free Sandbox number: its directory, made once. Called
 /// under the project's guard, so no other claim runs meanwhile.
@@ -462,7 +466,7 @@ pub(crate) fn reopen(args: &SdkValue) -> Result<Arc<SandboxState>> {
         peer: bytes(&value, "peer")?,
         instance: bytes(&value, "instance")?,
     };
-    let control = dial.open()?;
+    let control = dial.open_waiting()?;
     let state = Arc::new(SandboxState {
         id: id.to_owned(),
         project: project.to_owned(),
@@ -627,6 +631,11 @@ mod tests {
         let mut ends = [0 as RawFd; 2];
         assert_eq!(unsafe { pipe2(ends.as_mut_ptr(), CLOEXEC) }, 0);
         unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) }
+    }
+
+    #[test]
+    fn sandbox_ids_sort_numerically() {
+        assert_eq!(sort_ids(vec![10, 2, 1, 11]), ["1", "2", "10", "11"]);
     }
 
     /// F-053: a child forked while a Guard is held shares the lock's open

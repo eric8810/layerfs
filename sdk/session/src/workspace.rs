@@ -8,7 +8,7 @@
 //! daemon. Nothing is retried: a refused or failed step is the call's answer.
 //! A Sandbox whose daemon ended itself when idle is found stopped by the
 //! next mount or listing, which reclaims it.
-use crate::job::{failed, Outcome};
+use crate::outcome::{failed, Outcome};
 use crate::registry::{
     lock, naming, random, sandbox, sandbox_live, sandbox_refreshed, text, Mount, SandboxState,
 };
@@ -52,7 +52,16 @@ fn place(args: &SdkValue, project: &Path) -> Result<Arc<SandboxState>, SdkRefusa
             Ok(state) => return Ok(state),
             Err(refusal) => match crate::discovery::gone_container(&refusal) {
                 Some((container, stopped)) => {
-                    crate::sandbox::reclaim(args, &id, container, stopped)?;
+                    match crate::sandbox::reclaim(args, &id, container, stopped) {
+                        Ok(_) => {}
+                        // reclaimed meanwhile, or restarted under the number
+                        Err(refusal)
+                            if matches!(refusal.code.as_str(), "NoSuchSandbox" | "Busy") =>
+                        {
+                            continue
+                        }
+                        Err(refusal) => return Err(refusal),
+                    }
                 }
                 None => return Err(refusal),
             },
@@ -61,22 +70,45 @@ fn place(args: &SdkValue, project: &Path) -> Result<Arc<SandboxState>, SdkRefusa
     crate::sandbox::start(args, project)
 }
 
+/// A daemon mount failure keeps its code and data, plus the acknowledged
+/// binding when the first step completed.
+fn mount_refusal(failure: Box<layerfs_api::MountFailure>) -> SdkRefusal {
+    let layerfs_api::MountFailure { bound, failure } = *failure;
+    let mut refusal = operation(failure);
+    if let Some(bound) = bound {
+        let mut detail = match refusal.detail {
+            SdkValue::Map(fields) => fields,
+            other => vec![("cause".to_owned(), other)],
+        };
+        detail.push((
+            "workspace".to_owned(),
+            SdkValue::Text(layerfs_bridge::sdk_values::hex(
+                &bound.token.workspace.to_bytes(),
+            )),
+        ));
+        detail.push(("namespace".to_owned(), SdkValue::Int(bound.token.namespace)));
+        refusal.detail = SdkValue::Map(detail);
+    }
+    refusal
+}
+
 /// `workspace.mount(branch)`: a new Workspace of `branch`, placed in one of
 /// the project's Sandboxes; its `sandbox` and `path`.
 pub(crate) fn mount(args: &SdkValue) -> Outcome {
     let branch = text(args, "branch")?;
     let project = crate::discovery::project_dir(args)?;
     let _placing = crate::discovery::guard(&project)?;
+    // The Branch is found by name in this process before placement, so a bad
+    // Branch neither starts nor reclaims a Sandbox.
+    let branch_id = crate::direct::branch_id(args, branch)?;
     let state = place(args, &project)?;
     let _guard = crate::discovery::guard(&state.directory)?;
     let id = WorkspaceId::from_authority(random()?).map_err(failed)?;
-    // The Branch is found by name in this process; the daemon binds its id.
-    let branch_id = crate::direct::branch_id(args, branch)?;
     let mounted = {
         let mut control = crate::trace::control(&state.controls)?;
         workspace(&mut control).mount(id, branch_id)
     };
-    let mounted = mounted.map_err(failed)?;
+    let mounted = mounted.map_err(mount_refusal)?;
     let mut value = values::mounted(&mounted, branch);
     if let SdkValue::Map(fields) = &mut value {
         fields.push(("sandbox".to_owned(), SdkValue::text(state.id.as_str())));
@@ -84,7 +116,31 @@ pub(crate) fn mount(args: &SdkValue) -> Outcome {
         let image = state.runtime.request().image.as_str();
         fields.push(("image".to_owned(), SdkValue::text(image)));
     }
-    crate::discovery::save_workspace(&state, &mounted, branch)?;
+    if let Err(mut refusal) = crate::discovery::save_workspace(&state, &mounted, branch) {
+        // The daemon already mounted it; try to release it once and keep the
+        // token/path in the error so the failure is attributable.
+        let token = mounted.bound.token;
+        let _ = crate::trace::control(&state.controls).and_then(|mut control| {
+            workspace(&mut control)
+                .unmount_checked(token, true)
+                .map_err(failed)
+        });
+        let mut detail = match refusal.detail {
+            SdkValue::Map(fields) => fields,
+            other => vec![("cause".to_owned(), other)],
+        };
+        detail.push((
+            "workspace".to_owned(),
+            SdkValue::Text(layerfs_bridge::sdk_values::hex(&token.workspace.to_bytes())),
+        ));
+        detail.push(("namespace".to_owned(), SdkValue::Int(token.namespace)));
+        detail.push((
+            "path".to_owned(),
+            SdkValue::Text(mounted.ready.directory.clone()),
+        ));
+        refusal.detail = SdkValue::Map(detail);
+        return Err(refusal);
+    }
     lock(&state.mounts)?.insert(
         mounted.ready.directory.clone(),
         Mount {
@@ -138,6 +194,8 @@ pub(crate) fn list(args: &SdkValue) -> Outcome {
                     Ok(_) => {}
                     // started again under the number meanwhile
                     Err(refusal) if refusal.code == "Busy" => items.push(item),
+                    // another process reclaimed it meanwhile
+                    Err(refusal) if refusal.code == "NoSuchSandbox" => {}
                     Err(refusal) => return Err(refusal),
                 }
             }
@@ -211,8 +269,15 @@ pub(crate) fn unmount(args: &SdkValue) -> Outcome {
     let answer = workspace(&mut *crate::trace::control(&state.controls)?)
         .unmount_checked(token, args.get_bool("discard"))
         .map_err(operation)?;
-    let value = values::unmounted(&answer)?;
-    std::fs::remove_file(crate::discovery::workspace_file(&state, token)).map_err(failed)?;
+    // The daemon already unmounted it: always drop the cache, and remove the
+    // record even if converting the answer fails.
+    let record = std::fs::remove_file(crate::discovery::workspace_file(&state, token));
     lock(&state.mounts)?.remove(path);
+    let value = values::unmounted(&answer)?;
+    if let Err(error) = record {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(failed(error));
+        }
+    }
     Ok(value)
 }

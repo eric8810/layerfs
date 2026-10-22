@@ -6,7 +6,7 @@
 //! with its output in a log file, and this binding keeps its process id. The
 //! Engine offers no per-exec cancel, so `cancel` signals the process group
 //! from a second command and waits (bounded) until it is gone.
-use crate::job::{failed, refused, Outcome};
+use crate::outcome::{failed, refused, Outcome};
 use crate::output::Spool;
 use crate::registry::{lock, naming, sandbox, sandbox_live, text, Process, SandboxState};
 use layerfs_bridge::control::{SdkRefusal, SdkValue};
@@ -45,6 +45,19 @@ fn run(
         .known_root_exit()
         .ok_or_else(|| refused("Unknown", "the command's exit code is not known"))?;
     Ok((code, stdout, stderr))
+}
+
+/// Validates the Sandbox, mount path and command before a caller opens an
+/// output sink; performs no command and no mutation.
+pub fn preflight(args: &SdkValue) -> Outcome {
+    let state = sandbox(args)?;
+    let path = text(args, "path")?;
+    let command = text(args, "command")?;
+    if command.is_empty() {
+        return Err(refused("InvalidInput", "command must not be empty"));
+    }
+    let _ = state.directory(path)?;
+    Ok(SdkValue::Null)
 }
 
 /// `workspace.exec(ws, command, { background?, spool? })`; with
